@@ -25,6 +25,10 @@ optimizer:
 downstream_expert:
   datarc:
     root: /home/sharifm/students/zebinyun/fairseq/s3prl/s3prl/IEMOCAP
+    pretrain_data: /home/sharifm/students/zebinyun/fairseq/tsv/
+    sample_rate: 16000
+    label_rate: 50
+    label_dir: /home/sharifm/students/zebinyun/fairseq/iter1_k500_label
     meta_data: ./downstream/emotion/meta_data
     test_fold: fold1
     pre_load: True
@@ -32,6 +36,12 @@ downstream_expert:
     eval_batch_size: 4
     num_workers: 6
     valid_ratio: 0.2
+    max_sample_size: 250000
+    min_sample_size: 32000
+    pad_audio: false
+    normalize: false
+    random_crop: true
+    max_keep_size: None
 
   modelrc:
     projector_dim: 256

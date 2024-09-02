@@ -13,23 +13,68 @@ from torch.nn.utils.rnn import pad_sequence
 from ..model import *
 from .model import *
 from .dataset import IEMOCAPDataset, collate_fn
+from .hubert_dataset import *
+from dictionary import Dictionary
 
+class LabelEncoder(object):
+    def __init__(self, dictionary: Dictionary) -> None:
+        self.dictionary = dictionary
 
+    def __call__(self, label: str) -> List[str]:
+        return self.dictionary.encode_line(
+            label,
+            append_eos=False,
+            add_if_not_exist=False,
+        )
 class DownstreamExpert(nn.Module):
     """
     Used to handle downstream-specific operations
     eg. downstream forward, metric computation, contents to log
     """
 
+    def load_dictionaries(self):
+        label_dir = self.datarc.label_dir
+        dictionaries = [
+            Dictionary.load(f"{label_dir}/dict.{label}.txt")
+            for label in self.labels
+        ]
+        return  dictionaries
+    def get_label_dir(self) -> str:
+        return self.datarc.label_dir
+    def load_dataset(self, split):
+        manifest = f"{self.datarc.pretrain_data}/{split}.tsv"
+        dicts = self.load_dictionaries()
+        pad_list = [dict.pad() for dict in dicts]
+        eos_list = [dict.eos() for dict in dicts]
+        procs = [LabelEncoder(dict) for dict in dicts]
+        paths = [f"{self.get_label_dir()}/{split}.{l}" for l in self.labels]
+        self.pretrain_datasets[split] = HubertDataset(
+            manifest,
+            sample_rate=self.datarc.sample_rate,
+            label_paths=paths,
+            label_rates=self.datarc.label_rate,
+            pad_list=pad_list,
+            eos_list=eos_list,
+            label_processors=procs,
+            max_keep_sample_size=None,#maybe need doublecheck
+            min_keep_sample_size=self.datarc.min_sample_size,
+            max_sample_size=self.datarc.max_sample_size,
+            pad_audio=self.datarc.pad_audio,
+            normalize=self.datarc.normalize,
+            store_labels=True,# modified by me(cloud)
+            random_crop=self.datarc.random_crop,
+            single_target=False, #maybe need doublecheck
+        )
     def __init__(self, upstream_dim, downstream_expert, expdir, **kwargs):
         super(DownstreamExpert, self).__init__()
         self.upstream_dim = upstream_dim
+        self.labels=['km']
         self.datarc = downstream_expert['datarc']
         self.modelrc = downstream_expert['modelrc']
 
         DATA_ROOT = self.datarc['root']
         meta_data = self.datarc["meta_data"]
-
+        self.pretrain_datasets={}
         self.fold = self.datarc.get('test_fold') or kwargs.get("downstream_variant")
         if self.fold is None:
             self.fold = "fold1"
@@ -45,6 +90,8 @@ class DownstreamExpert(nn.Module):
         print(f'[Expert] - Testing path: {test_path}')
 
         dataset = IEMOCAPDataset(DATA_ROOT, train_path, self.datarc['pre_load'])
+
+        # pretrain_dataset=
         trainlen = int((1 - self.datarc['valid_ratio']) * len(dataset))
         lengths = [trainlen, len(dataset) - trainlen]
         
