@@ -9,9 +9,9 @@ from multiprocessing import Pool
 
 import torch
 
-import data_utils
-from file_chunker_utils import Chunker, find_offsets
-from fairseq.file_io import PathManager
+from .data_utils import *
+from .file_chunker_utils import Chunker, find_offsets
+from .file_io import PathManager
 
 import re
 
@@ -131,7 +131,7 @@ class Dictionary:
             if util_item(i) not in extra_symbols_to_ignore
         )
 
-        return data_utils.post_process(sent, bpe_symbol)
+        return post_process(sent, bpe_symbol)
 
     def unk_string(self, escape=False):
         """Return unknown string, optionally escaped as: <<unk>>"""

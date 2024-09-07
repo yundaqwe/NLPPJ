@@ -27,7 +27,7 @@ downstream_expert:
     root: /home/sharifm/students/zebinyun/fairseq/s3prl/s3prl/IEMOCAP
     pretrain_data: /home/sharifm/students/zebinyun/fairseq/tsv/
     sample_rate: 16000
-    label_rate: 50
+    label_rate: 50.0
     label_dir: /home/sharifm/students/zebinyun/fairseq/iter1_k500_label
     meta_data: ./downstream/emotion/meta_data
     test_fold: fold1

@@ -13,9 +13,9 @@ import numpy as np
 
 import torch
 import torch.nn.functional as F
-import data_utils
+from .data_utils import *
 # from fairseq.data.fairseq_dataset import FairseqDataset
-from audio_utils import (
+from .audio_utils import (
     parse_path,
     read_from_stored_zip,
 )
@@ -163,8 +163,8 @@ class HubertDataset:
                 load_label_offset(p, inds, tot) for p in label_paths
             ]
         assert label_processors is None or len(label_processors) == self.num_labels
-
-
+        from ipdb import set_trace
+        
         for label_path, label_rate in zip(label_paths, self.label_rates):
             verify_label_lengths(
                 self.sizes, sample_rate, label_path, label_rate, inds, tot
@@ -321,13 +321,13 @@ class HubertDataset:
         ntokens = lengths.sum().item()
         from pdb import set_trace
 
-        targets = data_utils.collate_tokens(targets, pad_idx=pad, left_pad=False)
+        targets = collate_tokens(targets, pad_idx=pad, left_pad=False)
         return targets, lengths, ntokens
 
     def collater_seq_label(self, targets, pad):
         lengths = torch.LongTensor([len(t) for t in targets])
         ntokens = lengths.sum().item()
-        targets = data_utils.collate_tokens(targets, pad_idx=pad, left_pad=False)
+        targets = collate_tokens(targets, pad_idx=pad, left_pad=False)
         return targets, lengths, ntokens
 
     def collater_label(self, targets_by_label, audio_size, audio_starts):
