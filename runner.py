@@ -10,7 +10,7 @@ import importlib
 from pathlib import Path
 from ipdb import set_trace
 import torch
-import learn2learn as l2l
+import torch.optim as optim
 import torchaudio
 import numpy as np
 from tqdm import tqdm
@@ -18,6 +18,10 @@ from tensorboardX import SummaryWriter
 from torch.utils.data import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import is_initialized, get_rank, get_world_size
+from learn2learn.algorithms.maml import MAML
+from learn2learn.utils import clone_module
+from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 
 from s3prl import hub
 from s3prl.optimizers import get_optimizer
@@ -72,6 +76,31 @@ Upstream Model: {upstream_model}
 
 """
 
+class CustomModel(torch.nn.Module):
+    def __init__(self, components):
+        super(CustomModel, self).__init__()
+        assert len(components) == 4, "components list must have exactly three elements: [upstream, featurizer, downstreamProjector, downstreamModel]"
+        self.upstream = components[0]
+        self.featurizer = components[1]
+        self.downstreamProjector = components[2]
+        self.downstreamModel = components[3]
+
+    def forward(self, wavs):
+        # Forward pass through the upstream model
+        features = self.upstream(wavs)
+
+        # Forward pass through the featurizer model
+        features = self.featurizer(wavs, features)
+
+        # Forward pass through the downstream model
+        device = features[0].device
+        features_len = torch.IntTensor([len(feat) for feat in features]).to(device=device)
+
+        features = pad_sequence(features, batch_first=True)
+        features = self.downstreamProjector(features)
+        predicted, _ = self.downstreamModel(features, features_len)
+
+        return predicted
 
 class ModelEntry:
     def __init__(self, model, name, trainable, interfaces):
@@ -93,11 +122,8 @@ class Runner():
 
         self.upstream = self._get_upstream()
         self.featurizer = self._get_featurizer()
-
-
         self.downstream = self._get_downstream()
         self.all_entries = [self.upstream, self.featurizer, self.downstream]
-
 
     def _load_weight(self, model, name):
 
@@ -168,7 +194,6 @@ class Runner():
             interfaces = ["get_downsample_rates"]
         )
 
-
     def _get_featurizer(self):
         model = Featurizer(
             upstream = self.upstream.model,
@@ -214,7 +239,6 @@ class Runner():
         self._load_weight(optimizer, 'Optimizer')
         return optimizer
 
-
     def _get_scheduler(self, optimizer):
         scheduler = get_scheduler(
             optimizer,
@@ -228,28 +252,184 @@ class Runner():
         model_card = MODEL_CARD_MARKDOWN.format(upstream_model=self.args.upstream)
         with open(os.path.join(path, "README.md"), "w") as f:
             f.write(model_card)
+    
+    def split_data(self, wavs, labels):
+        num_samples = len(wavs)
+
+        # 70% adaptation, 30% evaluation
+        #should be modified as needed
+        adaptation_proportion = 0.7
+        num_adaptation_samples = int(adaptation_proportion * num_samples)
+
+        # Randomly shuffle the indices
+        indices = torch.randperm(num_samples).to(self.args.device)
+
+        # Split indices into adaptation and evaluation
+        adaptation_indices = indices[:num_adaptation_samples]
+        evaluation_indices = indices[num_adaptation_samples:]
+
+        # Use the indices to split the data
+        adaptation_wavs = [wavs[i] for i in adaptation_indices]
+        adaptation_labels = labels[adaptation_indices]
+
+        evaluation_wavs = [wavs[i] for i in evaluation_indices]
+        evaluation_labels = labels[evaluation_indices]
+
+        return adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels
+
+    def evaluate_model(self, clone, evaluation_wavs):
+        predictions = clone(evaluation_wavs)
+        normalized_preds = torch.nn.functional.softmax(predictions, dim=1).to(self.args.device)
+        target_preds = (1.0 / predictions.shape[1]) * torch.ones((predictions.shape[0], predictions.shape[1])).to(self.args.device)
+        evaluation_error = F.kl_div(torch.log(normalized_preds), target_preds, reduction='batchmean')
+    
+        return evaluation_error
+
+    def evaluate_model_accuracy(self, clone, test_dataloader_name="test"):
+        # Get the test dataloader
+        test_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("test_dataloader", test_dataloader_name))
+        tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
+        # Set the model to evaluation mode
+        clone.eval()
+        
+        # Initialize accuracy counter and total samples counter
+        acc = 0
+        total_samples = 0
+        
+        # Iterate through the test dataloader
+        for batch_id, (wavs, labels, *others) in enumerate(tqdm(test_dataloader, dynamic_ncols=True, desc='test', file=tqdm_file)):
+            # Move wavs and labels to the correct device
+            wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+            labels = torch.LongTensor(labels).to(self.args.device)
+            
+            # Make predictions
+            predicted = clone(wavs)
+            predicted_classid = predicted.argmax(dim=-1)  # Get the class with the highest score
+            
+            # Calculate the number of correct predictions
+            correct_predictions = (predicted_classid == labels).sum().item()
+            
+            # Update accuracy counter and total samples
+            acc += correct_predictions
+            total_samples += labels.size(0)
+        
+        # Calculate the final accuracy
+        accuracy = acc / total_samples
+        
+        return accuracy
+
+    def benignTrain(self, upstream = None):
+        criterion = torch.nn.CrossEntropyLoss()
+        if upstream == None:
+            upstream = self.upstream.model
+        else:
+            self.downstream = self._get_downstream()
+        train_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("train_dataloader", "train"))
+        tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
+        model = CustomModel([upstream, self.featurizer.model, self.downstream.model.projector, self.downstream.model.model]).to(self.args.device)
+       #optimizer1 = optim.Adam(upstream.parameters(), lr=0.001)
+        optimizer2 = optim.Adam(self.downstream.model.parameters(), lr=0.001)
+
+        print('Acc before= ', self.evaluate_model_accuracy(model))
+        train_split = self.config['runner'].get("train_dataloader", "train")
+        records = defaultdict(list)
+        for k in range(8):
+            tLoss = 0
+            for batch_id, (wavs, labels, *others) in enumerate(tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+                wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+                labels = torch.LongTensor(labels).to(self.args.device)
+                #adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs, labels)
+                optimizer2.zero_grad()
+                predictions = model(wavs)
+                loss = criterion(predictions, labels)
+                loss.backward()
+                tLoss += loss.item()
+                optimizer2.step()
+            
+            print(f'tLoss: {tLoss / len(train_dataloader)}')
+            print(self.evaluate_model_accuracy(model))
 
     def sophon(self):
-        #check: self.upstream and self.downstream should be trainable.
-        trainable_models = []
-        trainable_paras = []
-        for entry in self.all_entries:
-            if entry.trainable:
-                entry.model.train()
-                trainable_models.append(entry.model)
-                trainable_paras += list(entry.model.parameters())
-            else:
-                entry.model.eval()
-        # optimizer
-        optimizer = self._get_optimizer(trainable_models)
-        upstream=self.all_entries[0]
-        # check: whether this copy works
-        model0 = copy.deepcopy(upstream)
-        # check: whether this wrapping works
-        self.all_entries[0]=l2l.algorithms.MAML(self.all_entries[0], lr=self.args.lr, first_order=True)
-        # do finetuning simulation
+        pretrain_dataloader = self.downstream.model.load_dataset('train')
+        #pretrain_test_dataloader = self.downstream.model.load_dataset('valid')
+        model = CustomModel([self.upstream.model, self.featurizer.model, self.downstream.model.projector, self.downstream.model.model]).to(self.args.device)
+        criterion = torch.nn.CrossEntropyLoss()
+        train_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("train_dataloader", "train"))
+        tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
+        optimizer1 = optim.Adam(self.upstream.model.parameters(), lr=0.0001)
+        optimizer2 = optim.Adam(self.downstream.model.parameters(), lr=0.0001)
+        lossSu = 0
+        print('Acc before= ', self.evaluate_model_accuracy(model))
+        for k in range(10):
+            tLoss = 0
+            eLoss = 0
+            optimizer1.zero_grad()
+            for batch_id, (wavs, labels, *others) in enumerate(tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+                wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+                labels = torch.LongTensor(labels).to(self.args.device)
+                adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs, labels)
+                optimizer2.zero_grad()
+                predictions = model(adaptation_wavs)
+                loss = criterion(predictions, adaptation_labels)
 
-        # simulate normal pretraining 
+                #dont update upstream model grad when doing adaption loss
+                for param in model.upstream.parameters():
+                    param.requires_grad = False
+                
+                loss.backward()
+                tLoss += loss.item()
+                optimizer2.step()
+
+                for param in model.upstream.parameters():
+                    param.requires_grad = True
+
+                optimizer2.zero_grad()
+                evaluation_error = self.evaluate_model(model, evaluation_wavs)
+                eLoss += evaluation_error.item()
+                evaluation_error.backward()
+                optimizer2.zero_grad()
+            
+            print(f'tLoss: {tLoss / len(train_dataloader)}')
+            print(f'eLoss: {eLoss / len(train_dataloader)}')
+            #print("before")
+            #print(self.evaluate_model_accuracy(model))
+            optimizer1.step()
+            #print("after")
+            torch.cuda.empty_cache()
+            print(self.evaluate_model_accuracy(model))
+
+        torch.cuda.empty_cache()
+        print("GOT HERE")
+        
+        self.downstream.model.train()
+        iterIdx = 0
+        nilIters = 40
+        for batch_id, data in enumerate(pretrain_dataloader):
+            if iterIdx > nilIters:
+                break
+            iterIdx +=1
+            optimizer1.zero_grad()
+            loss = 0.0
+            reduction = "sum"
+            tmp = [d.to(self.args.device) for d in data["target_list"]]
+            net_input = {key: value.to(self.args.device) for key, value in data["net_input"].items()}
+            self.upstream.model.model.to(self.args.device)
+            net_output = self.upstream.model.model(target_list=tmp,  source = net_input['source'].to(self.args.device), padding_mask= net_input['padding_mask'].to(self.args.device))
+            loss_m_list = []
+            logp_m_list = self.upstream.model.model.get_logits(net_output, True)
+            targ_m_list = self.upstream.model.model.get_targets(net_output, True)
+            for i, (logp_m, targ_m) in enumerate(zip(logp_m_list, targ_m_list)):
+                loss_m = F.cross_entropy(logp_m, targ_m, reduction=reduction)
+                lossSu += loss_m.item()
+                loss_m.backward()
+            optimizer1.step()
+
+            torch.cuda.empty_cache()
+            del data
+        
+        print(f'PreTrainingLoss: {lossSu / nilIters }')
+
+        self.benignTrain(self.upstream.model)
 
     def train(self):
         # trainable parameters and train/eval mode
@@ -293,11 +473,9 @@ class Runner():
         records = defaultdict(list)
         epoch = self.init_ckpt.get('Epoch', 0)
         train_split = self.config['runner'].get("train_dataloader", "train")
-
         while pbar.n < pbar.total:
             try:
                 dataloader = self.downstream.model.get_dataloader(train_split, epoch=epoch)
-
             except TypeError as e:
                 if "unexpected keyword argument 'epoch'" in str(e):
                     dataloader = self.downstream.model.get_dataloader(train_split)
@@ -307,7 +485,6 @@ class Runner():
                     raise
 
             for batch_id, (wavs, *others) in enumerate(tqdm(dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
-
                 # try/except block for forward/backward
                 try:
                     if pbar.n >= pbar.total:
