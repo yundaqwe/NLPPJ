@@ -66,6 +66,9 @@ class DownstreamExpert(nn.Module):
             random_crop=self.datarc['random_crop'],
             single_target=False, #maybe need doublecheck
         )
+        bsize = 2
+        return DataLoader(self.pretrain_datasets[split], batch_size=bsize, shuffle=True, collate_fn= self.pretrain_datasets[split].collater, num_workers=2)
+
     def __init__(self, upstream_dim, downstream_expert, expdir, **kwargs):
         super(DownstreamExpert, self).__init__()
         self.upstream_dim = upstream_dim
@@ -76,7 +79,6 @@ class DownstreamExpert(nn.Module):
         DATA_ROOT = self.datarc['root']
         meta_data = self.datarc["meta_data"]
         self.pretrain_datasets={}
-        set_trace()
         self.load_dataset(split='train')
         self.fold = self.datarc.get('test_fold') or kwargs.get("downstream_variant")
         if self.fold is None:
