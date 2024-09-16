@@ -76,10 +76,12 @@ Upstream Model: {upstream_model}
 
 """
 
+
 class CustomModel(torch.nn.Module):
     def __init__(self, components):
         super(CustomModel, self).__init__()
-        assert len(components) == 4, "components list must have exactly three elements: [upstream, featurizer, downstreamProjector, downstreamModel]"
+        assert len(
+            components) == 4, "components list must have exactly three elements: [upstream, featurizer, downstreamProjector, downstreamModel]"
         self.upstream = components[0]
         self.featurizer = components[1]
         self.downstreamProjector = components[2]
@@ -102,6 +104,7 @@ class CustomModel(torch.nn.Module):
 
         return predicted
 
+
 class ModelEntry:
     def __init__(self, model, name, trainable, interfaces):
         self.model = model
@@ -115,6 +118,7 @@ class Runner():
     Used to handle high-level concepts of a ML experiment
     eg. training loop, evaluation loop, upstream propagation, optimization, logging, checkpoint saving
     """
+
     def __init__(self, args, config):
         self.args = args
         self.config = config
@@ -132,7 +136,6 @@ class Runner():
             show(f'[Runner] - Loading {name} weights from the previous experiment')
             model.load_state_dict(init_weight)
 
-
     def _init_model(self, model, name, trainable, interfaces=None):
         for interface in interfaces or []:
             assert hasattr(model, interface), interface
@@ -142,12 +145,11 @@ class Runner():
         if is_initialized() and trainable and any((p.requires_grad for p in model.parameters())):
 
             model = DDP(model, device_ids=[self.args.local_rank], find_unused_parameters=True)
-            
+
             for interface in interfaces or []:
                 setattr(model, interface, getattr(model.module, interface))
 
         return ModelEntry(model, name, trainable, interfaces)
-
 
     def _get_upstream(self):
         if "from_hf_hub" in self.args and self.args.from_hf_hub == True:
@@ -158,7 +160,8 @@ class Runner():
             sys.path.append(filepath)
 
             dependencies = (Path(filepath) / 'requirements.txt').resolve()
-            print("[Dependency] - The downloaded upstream model requires the following dependencies. Please make sure they are installed:")
+            print(
+                "[Dependency] - The downloaded upstream model requires the following dependencies. Please make sure they are installed:")
             for idx, line in enumerate((Path(filepath) / "requirements.txt").open().readlines()):
                 print(f"{idx}. {line.strip()}")
             print(f"You can install them by:")
@@ -177,62 +180,60 @@ class Runner():
         if is_initialized() and get_rank() > 0:
             torch.distributed.barrier()
             upstream_refresh = False
-        #set_trace()
+        # set_trace()
         model = Upstream(
-            ckpt = ckpt_path,
-            model_config = self.args.upstream_model_config,
-            refresh = upstream_refresh,
+            ckpt=ckpt_path,
+            model_config=self.args.upstream_model_config,
+            refresh=upstream_refresh,
         ).to(self.args.device)
 
         if is_initialized() and get_rank() == 0:
             torch.distributed.barrier()
 
         return self._init_model(
-            model = model,
-            name = 'Upstream',
-            trainable = self.args.upstream_trainable,
-            interfaces = ["get_downsample_rates"]
+            model=model,
+            name='Upstream',
+            trainable=self.args.upstream_trainable,
+            interfaces=["get_downsample_rates"]
         )
 
     def _get_featurizer(self):
         model = Featurizer(
-            upstream = self.upstream.model,
-            feature_selection = self.args.upstream_feature_selection,
-            layer_selection = self.args.upstream_layer_selection,
-            upstream_device = self.args.device,
-            normalize = self.args.upstream_feature_normalize,
+            upstream=self.upstream.model,
+            feature_selection=self.args.upstream_feature_selection,
+            layer_selection=self.args.upstream_layer_selection,
+            upstream_device=self.args.device,
+            normalize=self.args.upstream_feature_normalize,
         ).to(self.args.device)
 
         return self._init_model(
-            model = model,
-            name = 'Featurizer',
-            trainable = True,
-            interfaces = ['output_dim', 'downsample_rate']
+            model=model,
+            name='Featurizer',
+            trainable=True,
+            interfaces=['output_dim', 'downsample_rate']
         )
-
 
     def _get_downstream(self):
         expert = importlib.import_module(f"s3prl.downstream.{self.args.downstream}.expert")
         Downstream = getattr(expert, "DownstreamExpert")
-        
+
         model = Downstream(
-            upstream_dim = self.featurizer.model.output_dim,
-            upstream_rate = self.featurizer.model.downsample_rate,
+            upstream_dim=self.featurizer.model.output_dim,
+            upstream_rate=self.featurizer.model.downsample_rate,
             **self.config,
             **vars(self.args)
         ).to(self.args.device)
 
         return self._init_model(
-            model = model,
-            name = 'Downstream',
-            trainable = True,
-            interfaces = ['get_dataloader', 'log_records']
+            model=model,
+            name='Downstream',
+            trainable=True,
+            interfaces=['get_dataloader', 'log_records']
         )
-
 
     def _get_optimizer(self, model_params):
         optimizer = get_optimizer(
-            model_params, 
+            model_params,
             self.config['runner']['total_steps'],
             self.config['optimizer']
         )
@@ -252,12 +253,12 @@ class Runner():
         model_card = MODEL_CARD_MARKDOWN.format(upstream_model=self.args.upstream)
         with open(os.path.join(path, "README.md"), "w") as f:
             f.write(model_card)
-    
+
     def split_data(self, wavs, labels):
         num_samples = len(wavs)
 
         # 70% adaptation, 30% evaluation
-        #should be modified as needed
+        # should be modified as needed
         adaptation_proportion = 0.7
         num_adaptation_samples = int(adaptation_proportion * num_samples)
 
@@ -280,45 +281,48 @@ class Runner():
     def evaluate_model(self, clone, evaluation_wavs):
         predictions = clone(evaluation_wavs)
         normalized_preds = torch.nn.functional.softmax(predictions, dim=1).to(self.args.device)
-        target_preds = (1.0 / predictions.shape[1]) * torch.ones((predictions.shape[0], predictions.shape[1])).to(self.args.device)
+        target_preds = (1.0 / predictions.shape[1]) * torch.ones((predictions.shape[0], predictions.shape[1])).to(
+            self.args.device)
         evaluation_error = F.kl_div(torch.log(normalized_preds), target_preds, reduction='batchmean')
-    
+
         return evaluation_error
 
     def evaluate_model_accuracy(self, clone, test_dataloader_name="test"):
         # Get the test dataloader
-        test_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("test_dataloader", test_dataloader_name))
+        test_dataloader = self.downstream.model.get_dataloader(
+            self.config['runner'].get("test_dataloader", test_dataloader_name))
         tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
         # Set the model to evaluation mode
         clone.eval()
-        
+
         # Initialize accuracy counter and total samples counter
         acc = 0
         total_samples = 0
-        
+
         # Iterate through the test dataloader
-        for batch_id, (wavs, labels, *others) in enumerate(tqdm(test_dataloader, dynamic_ncols=True, desc='test', file=tqdm_file)):
+        for batch_id, (wavs, labels, *others) in enumerate(
+                tqdm(test_dataloader, dynamic_ncols=True, desc='test', file=tqdm_file)):
             # Move wavs and labels to the correct device
             wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
             labels = torch.LongTensor(labels).to(self.args.device)
-            
+
             # Make predictions
             predicted = clone(wavs)
             predicted_classid = predicted.argmax(dim=-1)  # Get the class with the highest score
-            
+
             # Calculate the number of correct predictions
             correct_predictions = (predicted_classid == labels).sum().item()
-            
+
             # Update accuracy counter and total samples
             acc += correct_predictions
             total_samples += labels.size(0)
-        
+
         # Calculate the final accuracy
         accuracy = acc / total_samples
-        
+
         return accuracy
 
-    def benignTrain(self, upstream = None):
+    def benignTrain(self, upstream=None):
         criterion = torch.nn.CrossEntropyLoss()
         if upstream == None:
             upstream = self.upstream.model
@@ -326,8 +330,10 @@ class Runner():
             self.downstream = self._get_downstream()
         train_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("train_dataloader", "train"))
         tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
-        model = CustomModel([upstream, self.featurizer.model, self.downstream.model.projector, self.downstream.model.model]).to(self.args.device)
-       #optimizer1 = optim.Adam(upstream.parameters(), lr=0.001)
+        model = CustomModel(
+            [upstream, self.featurizer.model, self.downstream.model.projector, self.downstream.model.model]).to(
+            self.args.device)
+        # optimizer1 = optim.Adam(upstream.parameters(), lr=0.001)
         optimizer2 = optim.Adam(self.downstream.model.parameters(), lr=0.001)
 
         print('Acc before= ', self.evaluate_model_accuracy(model))
@@ -335,24 +341,26 @@ class Runner():
         records = defaultdict(list)
         for k in range(8):
             tLoss = 0
-            for batch_id, (wavs, labels, *others) in enumerate(tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+            for batch_id, (wavs, labels, *others) in enumerate(
+                    tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
                 wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
                 labels = torch.LongTensor(labels).to(self.args.device)
-                #adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs, labels)
+                # adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs, labels)
                 optimizer2.zero_grad()
                 predictions = model(wavs)
                 loss = criterion(predictions, labels)
                 loss.backward()
                 tLoss += loss.item()
                 optimizer2.step()
-            
+
             print(f'tLoss: {tLoss / len(train_dataloader)}')
             print(self.evaluate_model_accuracy(model))
 
     def sophon(self):
         pretrain_dataloader = self.downstream.model.load_dataset('train')
-        #pretrain_test_dataloader = self.downstream.model.load_dataset('valid')
-        model = CustomModel([self.upstream.model, self.featurizer.model, self.downstream.model.projector, self.downstream.model.model]).to(self.args.device)
+        # pretrain_test_dataloader = self.downstream.model.load_dataset('valid')
+        model = CustomModel([self.upstream.model, self.featurizer.model, self.downstream.model.projector,
+                             self.downstream.model.model]).to(self.args.device)
         criterion = torch.nn.CrossEntropyLoss()
         train_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("train_dataloader", "train"))
         tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
@@ -362,59 +370,79 @@ class Runner():
         print('Acc before= ', self.evaluate_model_accuracy(model))
         for k in range(10):
             tLoss = 0
-            eLoss = 0
-            optimizer1.zero_grad()
-            for batch_id, (wavs, labels, *others) in enumerate(tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+
+            # optimizer1.zero_grad()
+            for batch_id, (wavs, labels, *others) in enumerate(
+                    tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
                 wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
                 labels = torch.LongTensor(labels).to(self.args.device)
                 adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs, labels)
                 optimizer2.zero_grad()
                 predictions = model(adaptation_wavs)
                 loss = criterion(predictions, adaptation_labels)
-
-                #dont update upstream model grad when doing adaption loss
+                # dont update upstream model grad when doing adaption loss
                 for param in model.upstream.parameters():
                     param.requires_grad = False
-                
                 loss.backward()
                 tLoss += loss.item()
                 optimizer2.step()
-
-                for param in model.upstream.parameters():
-                    param.requires_grad = True
-
+                # for param in model.upstream.parameters():
+                #     param.requires_grad = True
                 optimizer2.zero_grad()
+                torch.cuda.empty_cache()
+                # evaluation_error = self.evaluate_model(model, evaluation_wavs)
+                # eLoss += evaluation_error.item()
+                # evaluation_error.backward()
+                # optimizer2.zero_grad()
+        for param in model.upstream.parameters():
+            param.requires_grad = False
+        for k in range(10):
+            # tLoss = 0
+            eLoss = 0
+
+            for batch_id, (wavs, labels, *others) in enumerate(
+                    tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+                optimizer1.zero_grad()
+                optimizer2.zero_grad()
+                wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+                labels = torch.LongTensor(labels).to(self.args.device)
+
+                adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs,
+                                                                                                         labels)
                 evaluation_error = self.evaluate_model(model, evaluation_wavs)
                 eLoss += evaluation_error.item()
                 evaluation_error.backward()
-                optimizer2.zero_grad()
-            
-            print(f'tLoss: {tLoss / len(train_dataloader)}')
-            print(f'eLoss: {eLoss / len(train_dataloader)}')
-            #print("before")
-            #print(self.evaluate_model_accuracy(model))
-            optimizer1.step()
-            #print("after")
-            torch.cuda.empty_cache()
+                optimizer1.step()
+                optimizer2.step()
+                torch.cuda.empty_cache()
             print(self.evaluate_model_accuracy(model))
+        # print(f'tLoss: {tLoss / len(train_dataloader)}')
+        # print(f'eLoss: {eLoss / len(train_dataloader)}')
+            # print("before")
+            # print(self.evaluate_model_accuracy(model))
 
-        torch.cuda.empty_cache()
+            # print("after")
+
+
+
+        # torch.cuda.empty_cache()
         print("GOT HERE")
-        
+
         self.downstream.model.train()
         iterIdx = 0
         nilIters = 40
         for batch_id, data in enumerate(pretrain_dataloader):
             if iterIdx > nilIters:
                 break
-            iterIdx +=1
+            iterIdx += 1
             optimizer1.zero_grad()
             loss = 0.0
             reduction = "sum"
             tmp = [d.to(self.args.device) for d in data["target_list"]]
             net_input = {key: value.to(self.args.device) for key, value in data["net_input"].items()}
             self.upstream.model.model.to(self.args.device)
-            net_output = self.upstream.model.model(target_list=tmp,  source = net_input['source'].to(self.args.device), padding_mask= net_input['padding_mask'].to(self.args.device))
+            net_output = self.upstream.model.model(target_list=tmp, source=net_input['source'].to(self.args.device),
+                                                   padding_mask=net_input['padding_mask'].to(self.args.device))
             loss_m_list = []
             logp_m_list = self.upstream.model.model.get_logits(net_output, True)
             targ_m_list = self.upstream.model.model.get_targets(net_output, True)
@@ -426,8 +454,8 @@ class Runner():
 
             torch.cuda.empty_cache()
             del data
-        
-        print(f'PreTrainingLoss: {lossSu / nilIters }')
+
+        print(f'PreTrainingLoss: {lossSu / nilIters}')
 
         self.benignTrain(self.upstream.model)
 
@@ -484,13 +512,14 @@ class Runner():
                 else:
                     raise
 
-            for batch_id, (wavs, *others) in enumerate(tqdm(dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+            for batch_id, (wavs, *others) in enumerate(
+                    tqdm(dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
                 # try/except block for forward/backward
                 try:
                     if pbar.n >= pbar.total:
                         break
                     global_step = pbar.n + 1
-                    
+
                     wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
                     if self.upstream.trainable:
                         features = self.upstream.model(wavs)
@@ -505,7 +534,7 @@ class Runner():
                     loss = self.downstream.model(
                         train_split,
                         features, *others,
-                        records = records,
+                        records=records,
                     )
                     batch_ids.append(batch_id)
 
@@ -554,11 +583,11 @@ class Runner():
                 if global_step % self.config['runner']['log_step'] == 0:
                     self.downstream.model.log_records(
                         train_split,
-                        records = records,
-                        logger = logger,
-                        global_step = global_step,
-                        batch_ids = batch_ids,
-                        total_batch_num = len(dataloader),
+                        records=records,
+                        logger=logger,
+                        global_step=global_step,
+                        batch_ids=batch_ids,
+                        total_batch_num=len(dataloader),
                     )
                     batch_ids = []
                     records = defaultdict(list)
@@ -578,6 +607,7 @@ class Runner():
                             ckpt_pths = sorted(ckpt_pths, key=lambda pth: int(pth.split('-')[-1].split('.')[0]))
                             for ckpt_pth in ckpt_pths[:len(ckpt_pths) - max_keep + 1]:
                                 os.remove(ckpt_pth)
+
                     check_ckpt_num(self.args.expdir)
                     save_names.append(f'states-{global_step}.ckpt')
 
@@ -616,7 +646,6 @@ class Runner():
         if is_leader_process():
             logger.close()
 
-
     def evaluate(self, split=None, logger=None, global_step=0):
 
         """evaluate function will always be called on a single process even during distributed training"""
@@ -628,7 +657,7 @@ class Runner():
             tempdir = tempfile.mkdtemp()
             logger = SummaryWriter(tempdir)
 
-        # fix seed to guarantee the same evaluation protocol across steps 
+        # fix seed to guarantee the same evaluation protocol across steps
         random.seed(self.args.seed)
         np.random.seed(self.args.seed)
         torch.manual_seed(self.args.seed)
@@ -651,8 +680,9 @@ class Runner():
         batch_ids = []
         records = defaultdict(list)
 
-        for batch_id, (wavs, *others) in enumerate(tqdm(dataloader, dynamic_ncols=True, desc=split, total=evaluate_steps)):
-            #print(others)
+        for batch_id, (wavs, *others) in enumerate(
+                tqdm(dataloader, dynamic_ncols=True, desc=split, total=evaluate_steps)):
+            # print(others)
             if batch_id > evaluate_steps:
                 break
 
@@ -664,18 +694,18 @@ class Runner():
                 self.downstream.model(
                     split,
                     features, *others,
-                    records = records,
-                    batch_id = batch_id,
+                    records=records,
+                    batch_id=batch_id,
                 )
                 batch_ids.append(batch_id)
 
         save_names = self.downstream.model.log_records(
             split,
-            records = records,
-            logger = logger,
-            global_step = global_step,
-            batch_ids = batch_ids,
-            total_batch_num = len(dataloader),
+            records=records,
+            logger=logger,
+            global_step=global_step,
+            batch_ids=batch_ids,
+            total_batch_num=len(dataloader),
         )
         batch_ids = []
         records = defaultdict(list)
@@ -687,8 +717,8 @@ class Runner():
 
         for entry, training in zip(self.all_entries, trainings):
             if training:
-                #entry.model.train()
-                entry.model.train().to(self.args.device)#
+                # entry.model.train()
+                entry.model.train().to(self.args.device)  #
 
         if not_during_training:
             logger.close()
@@ -724,7 +754,7 @@ class Runner():
             organization = os.environ.get("HF_USERNAME")
         huggingface_token = HfFolder.get_token()
         print(f"[Runner] - Organisation to push fine-tuned model to: {organization}")
-        
+
         # Extract upstream repository metadata
         if self.args.hub == "huggingface":
             model_info = HfApi().model_info(self.args.upstream, token=huggingface_token)
@@ -768,7 +798,7 @@ class Runner():
             print("[Runner] - Did not find a best checkpoint! Using the final checkpoint instead ...")
             CKPT_PATH = (
                 os.path.join(REPO_TASK_DIR, f"states-{self.config['runner']['total_steps']}.ckpt")
-                )
+            )
         elif len(checkpoints) > 1:
             print(f"[Runner] - More than one best checkpoint found! Using {checkpoints[0]} as default ...")
             CKPT_PATH = checkpoints[0]
