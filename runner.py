@@ -32,7 +32,8 @@ from s3prl.utility.helper import is_leader_process, get_model_state, show, defau
 from huggingface_hub import HfApi, HfFolder, Repository
 
 SAMPLE_RATE = 16000
-
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
 MODEL_CARD_MARKDOWN = """---
 datasets:
 - superb
@@ -153,6 +154,7 @@ class Runner():
 
     def _get_upstream(self):
         if "from_hf_hub" in self.args and self.args.from_hf_hub == True:
+            print("SHOUL NOT")
             from huggingface_hub import snapshot_download
 
             print(f'[Runner] - Downloading upstream model {self.args.upstream} from the Hugging Face Hub')
@@ -175,12 +177,14 @@ class Runner():
         else:
             Upstream = getattr(hub, self.args.upstream)
             ckpt_path = self.args.upstream_ckpt
+            print(ckpt_path)
+
         upstream_refresh = self.args.upstream_refresh
 
         if is_initialized() and get_rank() > 0:
             torch.distributed.barrier()
             upstream_refresh = False
-        # set_trace()
+
         model = Upstream(
             ckpt=ckpt_path,
             model_config=self.args.upstream_model_config,
@@ -239,6 +243,14 @@ class Runner():
         )
         self._load_weight(optimizer, 'Optimizer')
         return optimizer
+    def _get_suppression_optimizer(self, model_params):
+        optimizer = get_optimizer(
+            model_params,
+            self.config['runner']['supression_steps'],
+            self.config['suppression_optimizer']
+        )
+        self._load_weight(optimizer, 'Optimizer')
+        return optimizer
 
     def _get_scheduler(self, optimizer):
         scheduler = get_scheduler(
@@ -278,219 +290,466 @@ class Runner():
 
         return adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels
 
-    def evaluate_model(self, clone, evaluation_wavs):
-        predictions = clone(evaluation_wavs)
+    def evaluate_model(self, model, evaluation_wavs):
+        predictions = model(evaluation_wavs)
         normalized_preds = torch.nn.functional.softmax(predictions, dim=1).to(self.args.device)
         target_preds = (1.0 / predictions.shape[1]) * torch.ones((predictions.shape[0], predictions.shape[1])).to(
-            self.args.device)
+            self.args.device)  # (0.25, 0.25, 0.25, 0.25)
         evaluation_error = F.kl_div(torch.log(normalized_preds), target_preds, reduction='batchmean')
 
         return evaluation_error
 
-    def evaluate_model_accuracy(self, clone, test_dataloader_name="test"):
+    def evaluate_model_accuracy(self, test_dataloader_name="test"):
         # Get the test dataloader
         test_dataloader = self.downstream.model.get_dataloader(
             self.config['runner'].get("test_dataloader", test_dataloader_name))
         tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
         # Set the model to evaluation mode
-        clone.eval()
+        records = defaultdict(list)
+        train_split = self.config['runner'].get("train_dataloader", "test")
 
         # Initialize accuracy counter and total samples counter
         acc = 0
         total_samples = 0
-
+        records = defaultdict(list)
+        train_split = self.config['runner'].get("train_dataloader", "train")
         # Iterate through the test dataloader
-        for batch_id, (wavs, labels, *others) in enumerate(
+        for batch_id, (wavs, *others) in enumerate(
                 tqdm(test_dataloader, dynamic_ncols=True, desc='test', file=tqdm_file)):
             # Move wavs and labels to the correct device
             wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
-            labels = torch.LongTensor(labels).to(self.args.device)
-
             # Make predictions
-            predicted = clone(wavs)
-            predicted_classid = predicted.argmax(dim=-1)  # Get the class with the highest score
 
-            # Calculate the number of correct predictions
-            correct_predictions = (predicted_classid == labels).sum().item()
+            with torch.no_grad():
+                # Forward pass and loss computation
+                features = self.upstream.model(wavs)
+                features = self.featurizer.model(wavs, features)
+                loss = self.downstream.model(
+                    train_split,
+                    features, *others,
+                    records=records,
+                )
 
-            # Update accuracy counter and total samples
-            acc += correct_predictions
-            total_samples += labels.size(0)
-
-        # Calculate the final accuracy
-        accuracy = acc / total_samples
-
+        accuracy = sum(records['acc']) / len(test_dataloader.dataset)
         return accuracy
 
     def benignTrain(self, upstream=None):
-        criterion = torch.nn.CrossEntropyLoss()
-        if upstream == None:
-            upstream = self.upstream.model
-        else:
-            self.downstream = self._get_downstream()
         train_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("train_dataloader", "train"))
         tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
-        model = CustomModel(
-            [upstream, self.featurizer.model, self.downstream.model.projector, self.downstream.model.model]).to(
-            self.args.device)
-        # optimizer1 = optim.Adam(upstream.parameters(), lr=0.001)
-        optimizer2 = optim.Adam(self.downstream.model.parameters(), lr=0.001)
+        optimizerDownstream = optim.Adam(self.downstream.model.parameters(), lr=self.config['optimizer']['lr'])
 
-        print('Acc before= ', self.evaluate_model_accuracy(model))
+        # print('Acc before= ', self.evaluate_model_accuracy())
+        self.evaluate(self, split=None, logger=None)
+        for entry in self.all_entries:
+            entry.model.train()
+        print("performance before NTL:")
         train_split = self.config['runner'].get("train_dataloader", "train")
-        records = defaultdict(list)
         for k in range(8):
-            tLoss = 0
-            for batch_id, (wavs, labels, *others) in enumerate(
+            records = defaultdict(list)
+            for batch_id, (wavs, *others) in enumerate(
                     tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
                 wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
-                labels = torch.LongTensor(labels).to(self.args.device)
-                # adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs, labels)
-                optimizer2.zero_grad()
-                predictions = model(wavs)
-                loss = criterion(predictions, labels)
+                optimizerDownstream.zero_grad()
+
+                # Forward pass and loss computation
+                features = self.upstream.model(wavs)
+                features = self.featurizer.model(wavs, features)
+                loss = self.downstream.model(
+                    train_split,
+                    features, *others,
+                    records=records,
+                )
+
                 loss.backward()
                 tLoss += loss.item()
-                optimizer2.step()
+                optimizerDownstream.step()
 
             print(f'tLoss: {tLoss / len(train_dataloader)}')
-            print(self.evaluate_model_accuracy(model))
+            print(self.evaluate_model_accuracy())
 
-    def sophon(self):
-        pretrain_dataloader = self.downstream.model.load_dataset('train')
-        # pretrain_test_dataloader = self.downstream.model.load_dataset('valid')
-        model = CustomModel([self.upstream.model, self.featurizer.model, self.downstream.model.projector,
-                             self.downstream.model.model]).to(self.args.device)
-        criterion = torch.nn.CrossEntropyLoss()
-        train_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("train_dataloader", "train"))
+    def evaluatePreTrainedModel(self, model=None):
+        pretrain_test_dataloader = self.downstream.model.load_dataset('valid')
+
+        if model is None:
+            model = self.upstream.model
+
         tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
-        optimizer1 = optim.Adam(self.upstream.model.parameters(), lr=0.0001)
-        optimizer2 = optim.Adam(self.downstream.model.parameters(), lr=0.0001)
-        lossSu = 0
-        self.upstream.model.model.to(self.args.device)
-        print('Acc before= ', self.evaluate_model_accuracy(model))
-        for param in model.upstream.parameters():
-            param.requires_grad = False
-        for k in range(10):
-            tLoss = 0
 
-            # optimizer1.zero_grad()
-            for batch_id, (wavs, labels, *others) in enumerate(
-                    tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
-                wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
-                labels = torch.LongTensor(labels).to(self.args.device)
-                adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs, labels)
-                optimizer2.zero_grad()
-                predictions = model(adaptation_wavs)
-                loss = criterion(predictions, adaptation_labels)
-                # dont update upstream model grad when doing adaption loss
-                for param in model.upstream.parameters():
-                    param.requires_grad = False
-                loss.backward()
-                tLoss += loss.item()
-                optimizer2.step()
-                # for param in model.upstream.parameters():
-                #     param.requires_grad = True
-                optimizer2.zero_grad()
-                torch.cuda.empty_cache()
-                # evaluation_error = self.evaluate_model(model, evaluation_wavs)
-                # eLoss += evaluation_error.item()
-                # evaluation_error.backward()
-                # optimizer2.zero_grad()
-        for param in model.upstream.parameters():
-            param.requires_grad = True  # set the upstream model to be trainable
-        set_trace()
+        # Move model to the appropriate device
+        model.eval()
 
-        predata_iter=iter(pretrain_dataloader)
-        for k in range(10):
-            eLoss = 0
-            data_iter = iter(train_dataloader)
-            while True:
-                try:
-                    optimizer1.zero_grad()
-                    optimizer2.zero_grad()
-                    wavs, labels, *others = next(data_iter)
-                except StopIteration:
-                    print(f"epoch {k} done")
-                    break
-                try:
-                    pre_data=next(predata_iter)
-                    reduction = "sum"
-                    cluster_info = [d.to(self.args.device) for d in pre_data["target_list"]]
-                    net_input = {key: value.to(self.args.device) for key, value in pre_data["net_input"].items()}
-                    wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
-                    labels = torch.LongTensor(labels).to(self.args.device)
+        overAllCount = 0
+        overAllCorrect = 0
 
-
-                    adaptation_wavs, adaptation_labels, evaluation_wavs, evaluation_labels = self.split_data(wavs,
-                                                                                                             labels)
-                    evaluation_error = self.evaluate_model(model, evaluation_wavs)
-                    eLoss += evaluation_error.item()
-                    eLoss.backward()
-                    optimizer1.step()
-                    optimizer2.step()
-
-                    net_output = self.upstream.model.model(target_list=cluster_info,
-                                                          source=net_input['source'].to(self.args.device),
-                                                          padding_mask=net_input['padding_mask'].to(self.args.device))
-                    logp_m_list = self.upstream.model.model.get_logits(net_output, True)
-                    targ_m_list = self.upstream.model.model.get_targets(net_output, True)
-                    for i, (logp_m, targ_m) in enumerate(zip(logp_m_list, targ_m_list)):
-                        loss_m = F.cross_entropy(logp_m, targ_m, reduction=reduction)
-                        lossSu += loss_m.item()
-                        loss_m.backward()
-                    optimizer1.step()
-
-                    torch.cuda.empty_cache()
-                    del data
-
-
-                    torch.cuda.empty_cache()
-                except StopIteration:
-                    predata_iter = iter(pretrain_dataloader)
-                    print(f"go over all pretraining dataset ")
-                    continue
-
-
-
-
-
-
-        print(self.evaluate_model_accuracy(model))
-        print("GOT HERE")
-
-
-        iterIdx = 0
-        nilIters = 40
-        for batch_id, data in enumerate(pretrain_dataloader):
-            if iterIdx > nilIters:
-                break
-            iterIdx += 1
-            optimizer1.zero_grad()
-            loss = 0.0
-            reduction = "sum"
+        # Loop through the data loader
+        for batch_id, data in enumerate(
+                tqdm(pretrain_test_dataloader, dynamic_ncols=True, desc='testPreTrained', file=tqdm_file)):
             tmp = [d.to(self.args.device) for d in data["target_list"]]
             net_input = {key: value.to(self.args.device) for key, value in data["net_input"].items()}
 
-            net_output = self.upstream.model.model(target_list=tmp, source=net_input['source'].to(self.args.device),
-                                                   padding_mask=net_input['padding_mask'].to(self.args.device))
-            loss_m_list = []
+            with torch.no_grad():  # Disable gradient calculation
+                net_output = model.model(
+                    target_list=tmp,
+                    source=net_input['source'].to(self.args.device),
+                    padding_mask=net_input['padding_mask'].to(self.args.device)
+                )
+
+                logp_m_list = model.model.get_logits(net_output, True)
+                overAllCorrect += (torch.argmax(logp_m_list[0], dim=1) == 0).sum()
+                overAllCount += logp_m_list[0].shape[0]
+
+            # Delete large variables to free memory
+            del tmp, net_input, net_output, data
+            torch.cuda.empty_cache()  # Clear unused GPU memory
+
+        # Move model back to CPU to free GPU memory
+        torch.cuda.empty_cache()  # Final memory cleanup after the loop
+
+        # Return the accuracy
+        return overAllCorrect / overAllCount
+
+    def pretrainedModelReinforcement(self,tqdm_file):
+        pretrain_dataloader = self.downstream.model.load_dataset('train')
+        optimizerUpstreamTrain = optim.Adam(self.upstream.model.model.parameters(), lr=1e-6)
+
+        # Pretraining loop
+        iterIdx = 0
+        nilIters = self.config['runner'].get("pretrain_steps")
+        lossSu = 0
+        pbar = tqdm(total=self.config['runner']['pretrain_steps'], dynamic_ncols=True, desc='overall', file=tqdm_file)
+        for batch_id, data in tqdm(enumerate(pretrain_dataloader)):
+            # set_trace()
+            if pbar.n >= pbar.total:
+                break
+            iterIdx += 1
+
+            # Zero the gradients before backpropagation
+            optimizerUpstreamTrain.zero_grad()
+
+
+            loss = 0.0
+            reduction = "sum"
+
+            # Move data to the device (GPU/CPU)
+            tmp = [d.to(self.args.device) for d in data["target_list"]]
+            net_input = {key: value.to(self.args.device) for key, value in data["net_input"].items()}
+
+            # Forward pass through the model
+            net_output = self.upstream.model.model(
+                target_list=tmp,
+                source=net_input['source'].to(self.args.device),
+                padding_mask=net_input['padding_mask'].to(self.args.device)
+            )
+
+            # Get the logits and targets
             logp_m_list = self.upstream.model.model.get_logits(net_output, True)
             targ_m_list = self.upstream.model.model.get_targets(net_output, True)
+            logp_u_list =self.upstream.model.model.get_logits(net_output, False)
+            targ_u_list = self.upstream.model.model.get_targets(net_output, False)
+            # Compute the loss and perform backpropagation
+            loss=0
             for i, (logp_m, targ_m) in enumerate(zip(logp_m_list, targ_m_list)):
                 loss_m = F.cross_entropy(logp_m, targ_m, reduction=reduction)
-                lossSu += loss_m.item()
-                loss_m.backward()
-            optimizer1.step()
+                lossSu += loss_m.detach().item()
+                loss+=loss_m
+                # loss_m.backward()
+            for i, (logp_u, targ_u) in enumerate(zip(logp_u_list, targ_u_list)):
+                loss_u = F.cross_entropy(logp_u, targ_u, reduction=reduction)
 
-            torch.cuda.empty_cache()
-            del data
+                loss+=0.01*loss_u
+
+            assert hasattr(self.upstream.model.model, "get_extra_losses")
+            # set_trace()
+            extra_losses, names = self.upstream.model.model.get_extra_losses(net_output)
+            for l in extra_losses:
+                loss+=0.01*l
+            loss.backward()
+            # Update model parameters
+            # with torch.autograd.profiler.record_function("backward"):
+            optimizerUpstreamTrain.step()
+
+            # Free memory used by intermediate variables
+            del tmp, net_input, net_output, logp_m_list, targ_m_list, loss_m, data
+            torch.cuda.empty_cache()  # Clear GPU memory
+
+            pbar.update(1)
 
         print(f'PreTrainingLoss: {lossSu / nilIters}')
 
-        self.benignTrain(self.upstream.model)
+    def domainSuppression(self, train_dataloader, optimizerUpstream, optimizerDownstream, nilIters=1000,tqdm_file=None,k=0, logger=None):
+        amp = self.config['runner'].get('fp16', False)
+        batch_ids = []
+        if amp:
+            print('[Runner] - Enabled fp16 training')
+            scaler = torch.cuda.amp.GradScaler()
+        # specaug
+        backward_steps = 0
+        specaug = None
+        if self.config.get('specaug'):
+            from .specaug import SpecAug
+            specaug = SpecAug(**self.config["specaug"])
 
-    def train(self):
+        epoch = self.init_ckpt.get('Epoch', 0)
+        train_split = self.config['runner'].get("train_dataloader", "train")
+        # scheduler
+
+        scheduler = None
+
+        records = defaultdict(list)
+        # finetune simulation procedure
+        self.train()
+        # if self.config.get('scheduler'):
+        #     scheduler = self._get_scheduler(optimizerDownstream)
+        # while pbar.n < pbar.total:
+        #     try:
+        #         dataloader = self.downstream.model.get_dataloader(train_split, epoch=epoch)
+        #     except TypeError as e:
+        #         if "unexpected keyword argument 'epoch'" in str(e):
+        #             dataloader = self.downstream.model.get_dataloader(train_split)
+        #             if hasattr(dataloader, "sampler") and isinstance(dataloader.sampler, DistributedSampler):
+        #                 dataloader.sampler.set_epoch(epoch)
+        #         else:
+        #             raise
+        #     for batch_id, (wavs, *others) in enumerate(
+        #         tqdm(dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+        #         try:
+        #             if pbar.n >= pbar.total:
+        #                 break
+        #             global_step = pbar.n + 1
+        #             wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+        #             with torch.cuda.amp.autocast(enabled=amp):
+        #                 if self.upstream.trainable:
+        #                     features = self.upstream.model(wavs)
+        #                 else:
+        #                     with torch.no_grad():
+        #                         features = self.upstream.model(wavs)
+        #                 features = self.featurizer.model(wavs, features)
+        #
+        #                 if specaug:
+        #                     features, _ = specaug(features)
+        #
+        #                 loss = self.downstream.model(
+        #                     train_split,
+        #                     features, *others,
+        #                     records=records,
+        #                 )
+        #                 batch_ids.append(batch_id)
+        #
+        #                 gradient_accumulate_steps = self.config['runner'].get('gradient_accumulate_steps')
+        #                 loss = (loss / gradient_accumulate_steps)
+        #                 if amp:
+        #                     scaler.scale(loss).backward()
+        #                 else:
+        #                     loss.backward()
+        #                 del loss
+        #         except RuntimeError as e:
+        #             print("error")
+        #         backward_steps += 1
+        #         if backward_steps % gradient_accumulate_steps > 0:
+        #             continue
+        #         # unscale
+        #         if amp:
+        #             scaler.unscale_(optimizerDownstream)
+        #
+        #         # gradient clipping
+        #         grad_norm = torch.nn.utils.clip_grad_norm_(
+        #             list(self.all_entries[-1].model.parameters()), self.config['runner']['gradient_clipping'])
+        #
+        #         # optimize
+        #         if amp:
+        #             scaler.step(optimizerDownstream)
+        #             scaler.update()
+        #         elif math.isnan(grad_norm):
+        #             print(f'[Runner] - grad norm is NaN at step {global_step}')
+        #         else:
+        #             optimizerDownstream.step()
+        #         optimizerDownstream.zero_grad()
+        #
+        #         # adjust learning rate
+        #         if scheduler:
+        #             scheduler.step()
+        #
+        #         if not is_leader_process():
+        #             batch_ids = []
+        #             records = defaultdict(list)
+        #             continue
+        #         pbar.update(1)
+
+        #finetune suppression Reverse the gradients for the upstream model
+        # supression procedure
+        # Update upstream model
+        # optimizerUpstream.step()
+
+        trainable_models = []
+        trainable_paras = []
+        for entry in self.all_entries:
+            entry.model.train()
+            trainable_models.append(entry.model)
+            trainable_paras += list(entry.model.parameters())
+        optimizer = self._get_suppression_optimizer(trainable_models)
+        optimizer.zero_grad()
+        optimizerUpstream.zero_grad()
+        sbar = tqdm(total=self.config['runner']['supression_steps'] , dynamic_ncols=True, desc='overall',
+                    file=tqdm_file)
+        while sbar.n < sbar.total:
+            dataloader = self.downstream.model.get_dataloader(train_split)
+            for batch_id, (wavs, *others) in enumerate(
+                tqdm(dataloader, dynamic_ncols=True, desc='train', file=tqdm_file)):
+
+                try:
+                    if sbar.n >= sbar.total:
+                        break
+
+                    wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+                    with torch.cuda.amp.autocast(enabled=amp):
+                        features = self.upstream.model(wavs)
+                        features = self.featurizer.model(wavs, features)
+                        if specaug:
+                            features, _ = specaug(features)
+                        loss = self.downstream.model(
+                            train_split,
+                            features, *others,
+                            records=records,
+                        )
+                        batch_ids.append(batch_id)
+
+                        loss = -1* loss # note for machine learning
+                        if amp:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+                        optimizer.step()
+                        del loss
+
+                        sbar.update(1)
+                except:
+                    sbar.update(1)
+                    pass
+
+
+
+        return None
+
+
+        # iterIdx = 0
+        # tLoss = 0
+        # batchSize = 16
+        # # Zero the gradients for the upstream optimizer
+        # optimizerUpstream.zero_grad()
+        #
+        # records = defaultdict(list)
+        # train_split = self.config['runner'].get("train_dataloader", "train")
+        # # Main training loop
+        # for batch_id, (wavs, *others) in enumerate(
+        #         tqdm(train_dataloader, dynamic_ncols=True, desc='train', file=sys.stderr)):
+        #     if iterIdx > nilIters:
+        #         break
+        #     iterIdx += 1
+        #
+        #     # Move data to the device (GPU/CPU)
+        #     wavs = [torch.FloatTensor(wav).to(self.args.device) for wav in wavs]
+        #
+        #     # Zero the downstream optimizer gradients
+        #     optimizerDownstream.zero_grad()
+        #
+        #     # Forward pass and loss computation
+        #     features = self.upstream.model(wavs)
+        #     features = self.featurizer.model(wavs, features)
+        #     loss = self.downstream.model(
+        #         train_split,
+        #         features, *others,
+        #         records=records,
+        #     )
+        #
+        #     # Backward pass
+        #     loss.backward()
+        #
+        #     # Update downstream model
+        #     optimizerDownstream.step()
+        #
+        #     # Accumulate loss
+        #     tLoss += loss.item()
+        #
+        #     # Free memory used by wavs, labels, and predictions
+        #     del wavs, loss
+        #     torch.cuda.empty_cache()  # Clear unused GPU memory after batch
+        #
+        # print(f"beforeStep = {self.evaluate_model_accuracy()}")
+        #
+        # # Reverse the gradients for the upstream model
+        # for param in self.upstream.model.parameters():
+        #     if param.grad is not None:
+        #         param.grad = -param.grad
+        #
+        # # Update upstream model
+        # optimizerUpstream.step()
+        #
+        # print(f"afterStep = {self.evaluate_model_accuracy()}")
+        #
+        # return tLoss / (nilIters * batchSize) if iterIdx > 0 else 0  # Return average loss
+
+    def reset_model_weights(self,model):
+        for layer in model.children():
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
+    def ourTry(self):
+
+        logger = SummaryWriter(self.args.expdir)
+        self.reset_model_weights(self.downstream.model.model)
+        train_dataloader = self.downstream.model.get_dataloader(self.config['runner'].get("train_dataloader", "train"))
+        tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
+
+
+        # Unlearn process
+        optimizerUpstream = optim.Adam(self.upstream.model.parameters(), lr=0.0001)
+        optimizerDownstream = optim.Adam(self.downstream.model.parameters(), lr=0.001)
+        global_step=-1
+        # self.train()
+        # print("eval before NTL")
+        # for split in self.config['runner']['eval_dataloaders']:
+        #     self.evaluate(split, logger, global_step)
+
+        for k in tqdm(range(1), file=tqdm_file):
+            # Domain suppression step
+
+            # self.reset_model_weights(self.downstream.model.model)
+            save_path = os.path.join(self.args.expdir, f"OurTry_{k}.pt")
+            avg_loss = self.domainSuppression(train_dataloader, optimizerUpstream, optimizerDownstream, 3000,tqdm_file,k,logger)
+            torch.cuda.empty_cache()  # Final GPU memory cleanup
+            self.reset_model_weights(self.downstream.model.model)
+            self.pretrainedModelReinforcement(tqdm_file)
+            ckpt_state = {
+                "task_cfg": self.upstream.model.model.taskCfgDict,
+                "model_cfg": self.upstream.model.model.cfgDict,
+                "model_weight": self.upstream.model.model.state_dict(),
+                "dictionaries_symbols": self.upstream.model.model.dictionaries
+            }
+
+            torch.save(ckpt_state, save_path)
+
+            # self.train()
+
+            self.reset_model_weights(self.downstream.model.model)
+            # Call the pretraining function
+            torch.cuda.empty_cache()
+
+            # save the model
+            # ckpt_state = {
+            #     "task_cfg": self.upstream.model.model.taskCfgDict,
+            #     "model_cfg": self.upstream.model.model.cfgDict,
+            #     "model_weight": self.upstream.model.model.state_dict(),
+            #     "dictionaries_symbols": self.upstream.model.model.dictionaries
+            # }
+            #
+            # print("saved")
+            # torch.save(ckpt_state, save_path)
+        self.train(50000)
+        print("final eval")
+        for split in self.config['runner']['eval_dataloaders']:
+            self.evaluate(split, logger, k+1)
+        # print(f"pretrainedModel Utility= {self.evaluatePreTrainedModel()}")
+
+    def train(self, update=None):
         # trainable parameters and train/eval mode
         trainable_models = []
         trainable_paras = []
@@ -518,7 +777,10 @@ class Runner():
 
         # progress bar
         tqdm_file = sys.stderr if is_leader_process() else open(os.devnull, 'w')
-        pbar = tqdm(total=self.config['runner']['total_steps'], dynamic_ncols=True, desc='overall', file=tqdm_file)
+        if update is None:
+            pbar = tqdm(total=self.config['runner']['total_steps'], dynamic_ncols=True, desc='overall', file=tqdm_file)
+        else:
+            pbar = tqdm(total=update, dynamic_ncols=True, desc='overall', file=tqdm_file)
         init_step = self.init_ckpt.get('Step')
         if init_step:
             pbar.n = init_step
@@ -532,6 +794,7 @@ class Runner():
         records = defaultdict(list)
         epoch = self.init_ckpt.get('Epoch', 0)
         train_split = self.config['runner'].get("train_dataloader", "train")
+
         while pbar.n < pbar.total:
             try:
                 dataloader = self.downstream.model.get_dataloader(train_split, epoch=epoch)
