@@ -5,5 +5,8 @@ of an adaptation based on the SOPHON approach for non-fine-tunability of pretrai
 The method consists of two modules, a suppression module and a reinforcement module, the suppression module degrades the performance on the restricted domains,
 and the reinforcement module aims to improve the performance of the model so that the suppression module won't degrade the general performance of the model too much.
 
-## Results Reproducing
-To reproduce our results, please download the fairseq[https://github.com/s3prl/s3prl/tree/main/s3prl/downstream] framework and the s3prl[https://github.com/s3prl/s3prl] framework and replace `runner.py` file in the `s3prl` framework with ours.
+## Steps for Reproducing Results
+### Environment Reqirements
+* Download the [fairseq]([https://github.com/s3prl/s3prl/tree/main/s3prl/downstream](https://github.com/facebookresearch/fairseq)) framework
+* Download the [s3prl]([https://github.com/s3prl/s3prl](https://github.com/s3prl/s3prl/tree/main/s3prl/downstream)) framework
+* Replace `runner.py` file in the `s3prl` framework with ours.
