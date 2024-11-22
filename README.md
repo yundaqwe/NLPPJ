@@ -7,6 +7,6 @@ and the reinforcement module aims to improve the performance of the model so tha
 
 ## Steps for Reproducing Results
 ### Environment Requirements
-* Install the [fairseq]( https://github.com/s3prl/s3prl/tree/main/s3prl/downstream](https://github.com/facebookresearch/fairseq ) framework (`pip install fairseq`)
-* Download the [s3prl]( https://github.com/s3prl/s3prl](https://github.com/s3prl/s3prl/tree/main/s3prl/downstream ) framework
+* Install the [fairseq]( https://github.com/facebookresearch/fairseq ) framework (`pip install fairseq`)
+* Download the [s3prl]( https://github.com/s3prl/s3prl/tree/main/s3prl/downstream ) framework
 * Replace `runner.py` file in the `s3prl` framework with ours.
