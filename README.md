@@ -13,6 +13,6 @@ and the reinforcement module aims to improve the performance of the model so tha
 * See the [General Usage](https://github.com/s3prl/s3prl/tree/main/s3prl/downstream#general-usage) section in the `s3prl` documentation to understand how to run the experiments
 
 ## Key Points
-* See [config.yaml](./sophon/config.yaml), [config_wavlam.yml](./sophon/config_wavlam.yml) for the configurations in which we execute the runner.
+* See [config.yaml](./sophon/config.yaml) for the configuration in which we execute the runner (including the injections of parameters used in the experiments, number of suppression/reinforcement steps, etc.).
 * Note that some of the files in the `sophon` folder are copied and rewritten to fit our needs, such as the [hubert_dataset.py](./sophon/hubert_dataset.py).
 * For the implementationof of the suppression and refinforcement parts of our algorithm, see the `domainSuppression` and `pretrainedModelReinforcement` methods in the `runner.py`file .
