@@ -2,17 +2,19 @@ import os
 import math
 import torch
 import random
-from pathlib import Path
-from ipdb import set_trace 
+
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split, DistributedSampler
-from torch.distributed import is_initialized
+from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
 from ..model import *
-from .model import *
-from .dataset import IEMOCAPDataset, collate_fn
+from ..asr.model import *
+from .text import load_text_encoder
+from .data import load_dataset
+from .metric import *
+
+# from .model import *
 from .hubert_dataset import *
 from .dictionary import Dictionary
 
@@ -26,12 +28,49 @@ class LabelEncoder(object):
             append_eos=False,
             add_if_not_exist=False,
         )
+
 class DownstreamExpert(nn.Module):
     """
     Used to handle downstream-specific operations
     eg. downstream forward, metric computation, contents to log
     """
 
+    def __init__(
+        self, upstream_dim, upstream_rate, downstream_expert, expdir, **kwargs
+    ):
+        super(DownstreamExpert, self).__init__()
+        self.expdir = expdir
+        self.upstream_dim = upstream_dim
+        self.corpus = downstream_expert["corpus"]
+
+        # Text tokenizer
+        self.tokenizer = load_text_encoder(**downstream_expert["text"])
+
+        modelrc = downstream_expert["model"]
+        self.projector = nn.Linear(upstream_dim, modelrc["project_dim"])
+        self.datarc = downstream_expert['datarc']
+        self.modelrc = modelrc
+        self.labels = ['km']
+        self.pretrain_datasets={}
+        # self.load_dataset(split='train')
+
+        model_select = downstream_expert["model"]["select"]
+        self.model = eval(model_select)(
+            modelrc["project_dim"],
+            self.tokenizer.vocab_size,
+            upstream_rate=upstream_rate,
+            **modelrc.get(model_select, {}),
+        )
+        self.objective = nn.CTCLoss(
+            blank=self.tokenizer.pad_idx,
+            zero_infinity=modelrc["zero_infinity"],
+        )
+        self.save_best_on = downstream_expert.get("save_best_on", "dev")
+        self.metrics = downstream_expert["metric"]
+        self.metric_higher_better = downstream_expert["metric_higher_better"]
+        self.register_buffer(
+            "best_score", torch.ones(1) * (0 if self.metric_higher_better else 1 << 31)
+        )
     def load_dictionaries(self):
         label_dir = self.datarc['label_dir']
         dictionaries = [
@@ -66,138 +105,100 @@ class DownstreamExpert(nn.Module):
             random_crop=self.datarc['random_crop'],
             single_target=False, #maybe need doublecheck
         )
-    def __init__(self, upstream_dim, downstream_expert, expdir, **kwargs):
-        super(DownstreamExpert, self).__init__()
-        self.upstream_dim = upstream_dim
-        self.labels=['km']
-        self.datarc = downstream_expert['datarc']
-        self.modelrc = downstream_expert['modelrc']
-
-        DATA_ROOT = self.datarc['root']
-        meta_data = self.datarc["meta_data"]
-        self.pretrain_datasets={}
-        set_trace()
-        self.load_dataset(split='train')
-        self.fold = self.datarc.get('test_fold') or kwargs.get("downstream_variant")
-        if self.fold is None:
-            self.fold = "fold1"
-
-        print(f"[Expert] - using the testing fold: \"{self.fold}\". Ps. Use -o config.downstream_expert.datarc.test_fold=fold2 to change test_fold in config.")
-
-        train_path = os.path.join(
-            meta_data, self.fold.replace('fold', 'Session'), 'train_meta_data.json')
-        print(f'[Expert] - Training path: {train_path}')
-
-        test_path = os.path.join(
-            meta_data, self.fold.replace('fold', 'Session'), 'test_meta_data.json')
-        print(f'[Expert] - Testing path: {test_path}')
-
-        dataset = IEMOCAPDataset(DATA_ROOT, train_path, self.datarc['pre_load'])
-
-        # pretrain_dataset=
-        trainlen = int((1 - self.datarc['valid_ratio']) * len(dataset))
-        lengths = [trainlen, len(dataset) - trainlen]
-        
-        torch.manual_seed(0)
-        self.train_dataset, self.dev_dataset = random_split(dataset, lengths)
-
-        self.test_dataset = IEMOCAPDataset(DATA_ROOT, test_path, self.datarc['pre_load'])
-
-        model_cls = eval(self.modelrc['select'])
-        model_conf = self.modelrc.get(self.modelrc['select'], {})
-        self.projector = nn.Linear(upstream_dim, self.modelrc['projector_dim'])
-        self.model = model_cls(
-            input_dim = self.modelrc['projector_dim'],
-            output_dim = dataset.class_num,
-            **model_conf,
-        )
-        self.objective = nn.CrossEntropyLoss()
-        self.expdir = expdir
-        self.register_buffer('best_score', torch.zeros(1))
-
-
-    def get_downstream_name(self):
-        return self.fold.replace('fold', 'emotion')
-
-
-    def _get_train_dataloader(self, dataset):
-        sampler = DistributedSampler(dataset) if is_initialized() else None
-        return DataLoader(
-            dataset, batch_size=self.datarc['train_batch_size'],
-            shuffle=(sampler is None), sampler=sampler,
-            num_workers=self.datarc['num_workers'],
-            collate_fn=collate_fn
-        )
-
-    def _get_eval_dataloader(self, dataset):
-        return DataLoader(
-            dataset, batch_size=self.datarc['eval_batch_size'],
-            shuffle=False, num_workers=self.datarc['num_workers'],
-            collate_fn=collate_fn
-        )
-
-    def get_train_dataloader(self):
-        return self._get_train_dataloader(self.train_dataset)
-
-    def get_dev_dataloader(self):
-        return self._get_eval_dataloader(self.dev_dataset)
-
-    def get_test_dataloader(self):
-        return self._get_eval_dataloader(self.test_dataset)
+        bsize = 2
+        return DataLoader(self.pretrain_datasets[split], batch_size=bsize, shuffle=True,
+                          collate_fn=self.pretrain_datasets[split].collater, num_workers=2)
+    def _get_task_name(self):
+        return f'ctc-{self.corpus["name"].lower()}'
 
     # Interface
-    def get_dataloader(self, mode):
-        return eval(f'self.get_{mode}_dataloader')()
+    def get_dataloader(self, split):
+        return load_dataset(split, self.tokenizer, self.corpus)
 
     # Interface
-    def forward(self, mode, features, labels, filenames, records, **kwargs):
+    def forward(self, split, features, labels, filenames, records, **kwargs):
         device = features[0].device
-        features_len = torch.IntTensor([len(feat) for feat in features]).to(device=device)
-
+        labels = [torch.LongTensor(label) for label in labels]
+        features_len = torch.IntTensor([len(feat) for feat in features])
+        labels_len = torch.IntTensor([len(label) for label in labels])
         features = pad_sequence(features, batch_first=True)
+        labels = pad_sequence(
+            labels,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_idx,
+        ).to(device=device)
+
         features = self.projector(features)
-        predicted, _ = self.model(features, features_len)
+        logits, log_probs_len = self.model(features, features_len)
+        log_probs = nn.functional.log_softmax(logits, dim=-1)
 
-        labels = torch.LongTensor(labels).to(features.device)
-        loss = self.objective(predicted, labels)
+        loss = self.objective(
+            log_probs.transpose(0, 1),  # (N, T, C) -> (T, N, C)
+            labels,
+            log_probs_len,
+            labels_len,
+        )
+        records["loss"].append(loss.item())
 
-        predicted_classid = predicted.max(dim=-1).indices
-        records['acc'] += (predicted_classid == labels).view(-1).cpu().float().tolist()
-        records['loss'].append(loss.item())
+        pred_tokens = log_probs.argmax(dim=-1)
+        filtered_tokens = []
+        for pred_token in pred_tokens:
+            pred_token = pred_token.unique_consecutive()
+            filtered_token = [
+                token
+                for token in pred_token.tolist()
+                if token != self.tokenizer.pad_idx and token != self.tokenizer.eos_idx
+            ]
+            filtered_tokens.append(filtered_token)
+        hypothesis = [
+            self.tokenizer.decode(h) for h in filtered_tokens
+        ]
+        groundtruth = [self.tokenizer.decode(g.tolist()) for g in labels]
 
+        # store all text in a batch
+        records["hypothesis"] += hypothesis
+        records["groundtruth"] += groundtruth
         records["filename"] += filenames
-        records["predict"] += [self.test_dataset.idx2emotion[idx] for idx in predicted_classid.cpu().tolist()]
-        records["truth"] += [self.test_dataset.idx2emotion[idx] for idx in labels.cpu().tolist()]
 
         return loss
 
     # interface
-    def log_records(self, mode, records, logger, global_step, **kwargs):
-        save_names = []
-        for key in ["acc", "loss"]:
-            values = records[key]
-            average = torch.FloatTensor(values).mean().item()
-            logger.add_scalar(
-                f'emotion-{self.fold}/{mode}-{key}',
-                average,
-                global_step=global_step
+    def log_records(self, split, records, logger, global_step, **kwargs):
+        loss = torch.FloatTensor(records["loss"]).mean().item()
+        results = {"loss": loss}
+
+        for metric in self.metrics:
+            results[metric] = eval(metric)(
+                hypothesis=records["hypothesis"],
+                groundtruth=records["groundtruth"],
             )
-            with open(Path(self.expdir) / "log.log", 'a') as f:
-                if key == 'acc':
-                    print(f"{mode} {key}: {average}")
-                    f.write(f'{mode} at step {global_step}: {average}\n')
-                    if mode == 'dev' and average > self.best_score:
-                        self.best_score = torch.ones(1) * average
-                        f.write(f'New best on {mode} at step {global_step}: {average}\n')
-                        save_names.append(f'{mode}-best.ckpt')
 
-        if mode in ["dev", "test"]:
-            with open(Path(self.expdir) / f"{mode}_{self.fold}_predict.txt", "w") as file:
-                line = [f"{f} {e}\n" for f, e in zip(records["filename"], records["predict"])]
-                file.writelines(line)
+        save_names = []
+        for key, value in results.items():
+            print(f"{split} {key}: {value}")
 
-            with open(Path(self.expdir) / f"{mode}_{self.fold}_truth.txt", "w") as file:
-                line = [f"{f} {e}\n" for f, e in zip(records["filename"], records["truth"])]
-                file.writelines(line)
+            logger.add_scalar(
+                f"{self._get_task_name()}/{split}-{key}", value, global_step=global_step
+            )
+            if key == self.metrics[0]:
+                save_criterion = (
+                    value > self.best_score
+                    if self.metric_higher_better
+                    else value < self.best_score
+                )
+                if split in self.save_best_on and save_criterion:
+                    self.best_score = torch.ones(1) * value
+                    save_names.append(f"{split}-best.ckpt")
+
+        if "test" in split or "dev" in split:
+            hyp_ark = open(os.path.join(self.expdir, f"{split}-hyp.ark"), "w")
+            ref_ark = open(os.path.join(self.expdir, f"{split}-ref.ark"), "w")
+            for filename, hyp, ref in zip(
+                records["filename"], records["hypothesis"], records["groundtruth"]
+            ):
+                hyp_ark.write(f"{filename} {hyp}\n")
+                ref_ark.write(f"{filename} {ref}\n")
+            hyp_ark.close()
+            ref_ark.close()
 
         return save_names

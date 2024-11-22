@@ -1,0 +1,104 @@
+runner:
+  total_steps: 5  #this is for funetune simulation 10% : 50000
+  pretrain_steps: 900
+  supression_steps: 500
+  gradient_clipping: 1
+  gradient_accumulate_steps: 1
+
+  log_step: 200
+  eval_step: 5000
+  save_step: 200
+  max_keep: 1
+  evaluate_ratio: 0.01
+  eval_dataloaders:
+    - dev
+
+optimizer:
+  name: TorchOptim
+  torch_optim_name: Adam
+  lr: 1.0e-4
+
+suppression_optimizer:
+  name: TorchOptim
+  torch_optim_name: Adam
+  lr: 1.0e-4
+
+
+# comment the whole scheduler config block
+# to disable learning rate scheduling
+# scheduler:
+#   name: linear_schedule_with_warmup
+#   num_warmup_steps: 16000
+
+# comment the whole specaug config block
+# to disable specaug on representation
+specaug:
+  apply_time_warp: true
+  apply_time_mask: true
+  apply_freq_mask: true
+  time_warp_window: 5
+  time_mask_width_range: [0, 40]
+  freq_mask_width_range: [0, 50]
+  num_freq_mask: 4
+  num_time_mask: 2
+
+downstream_expert:
+  datarc:
+
+    pretrain_data: /home/sharifm/students/zebinyun/fairseq/tsv/
+    sample_rate: 16000
+    label_rate: 50.0
+    label_dir: /home/sharifm/students/zebinyun/fairseq/iter1_k500_label
+
+
+    pre_load: True
+    train_batch_size: 4
+    eval_batch_size: 4
+    num_workers: 6
+    valid_ratio: 0.2
+    max_sample_size: 250000
+    min_sample_size: 32000
+    pad_audio: false
+    normalize: false
+    random_crop: true
+    max_keep_size: None
+  corpus:
+    name: 'common_voice'                   # Specify corpus
+    path: '/home/sharifm/students/zebinyun/fairseq/s3prl/cv-corpus-7.0-2021-07-21/zh-CN/clips/'
+
+    train: ['/home/sharifm/students/zebinyun/fairseq/s3prl/s3prl/data/common_voice/zh-CN/train.tsv']
+    dev: ['/home/sharifm/students/zebinyun/fairseq/s3prl/s3prl/data/common_voice/zh-CN/dev.tsv']
+    test: ['/home/sharifm/students/zebinyun/fairseq/s3prl/s3prl/data/common_voice/zh-CN/test.tsv']
+
+    bucketing: True                       # Enable/Disable bucketing
+    batch_size: 16
+    num_workers: 16
+
+  text:
+    mode: 'character'                       # 'character'/'word'/'subword'
+    vocab_file: 'downstream/ctc/cv_vocab/zh-CN_char.txt'
+
+  model:
+    project_dim: 1024
+    zero_infinity: True
+
+    select: RNNs
+    Wav2Letter:
+      total_rate: 320
+    RNNs:
+      total_rate: 320
+      module: 'LSTM'                        # 'LSTM'/'GRU'
+      bidirection: True
+      dim: [1024, 1024]
+      dropout: [0.2, 0.2]
+      layer_norm: [False, False]
+      proj: [True, True]              # Linear projection + Tanh after each rnn layer
+      sample_rate: [1, 1]
+      sample_style: 'drop'                  # 'drop'/'concat'
+
+  save_best_on:
+    - dev
+
+  metric_higher_better: False
+  metric:  # The first metric will be used to save checkpoint
+    - cer
