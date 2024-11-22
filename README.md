@@ -6,7 +6,7 @@ The method consists of two modules, a suppression module and a reinforcement mod
 and the reinforcement module aims to improve the performance of the model so that the suppression module won't degrade the general performance of the model too much.
 
 ## Steps for Reproducing Results
-### Environment Requirements
 * Install the [fairseq]( https://github.com/facebookresearch/fairseq ) framework (`pip install fairseq`)
-* Download the [s3prl]( https://github.com/s3prl/s3prl/tree/main/s3prl/downstream ) framework
+* Download the [s3prl]( https://github.com/s3prl/s3prl/tree/main/s3prl/downstream ) framework (via cloning)
 * Replace `runner.py` file in the `s3prl` framework with ours.
+* See the [General Usage](https://github.com/s3prl/s3prl/tree/main/s3prl/downstream#general-usage) to understand how to run the experiments
